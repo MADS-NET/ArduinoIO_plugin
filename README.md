@@ -4,7 +4,6 @@ A MADS agent using <https://github.com/pbosetti/ArduinoDriver> for zero-programm
 
 ArduinoDriver provides both a firmware for most Arduino boards and a user land C++20 driver (plus CLI commands) for directly tapping into I/O pins (including analog and PWM and DAC) via USB interface rather than through Serial Port. This allows to select pins and operations from `mads.ini` plugin settings, and also exploiting higher rates of USB ports wrt serials.
 
-**Expected release: Fall 2026**
 
 This is a Source plugin for [MADS](https://github.com/MADS-NET/MADS). 
 
@@ -73,7 +72,7 @@ pin_modes = {"1"="OUTPUT", "2"="OUTPUT", "4"="PWM"}
 
 All settings are optional; if omitted, the default values are used.
 
-
+**NOTE**: currently, the plugin connects to the first available Arduino board found on the USB bus. In future releases, it will be possible to select a specific board by its serial number. if you **install** the plugin (`cmake --install build`), it also installs the `arduin0-io` command line utility, which can be used to test the plugin and to check the connected board. Just type `arduin0-io` to see the available commands.
 
 
 ## Executable demo
