@@ -20,6 +20,24 @@ Currently, the supported platforms are:
 * **MacOS**
 * **Windows**
 
+## Boards
+
+Look at <https://github.com/pbosetti/ArduinoDriver> for supported boards. The plugin is expected to work with all boards supported by ArduinoDriver.
+
+In the library manager of Arduino IDE, search for "UsbIo" and install it. Then, upload the firmware to your board:
+
+```cpp
+#include <UsbIo.h>
+
+void setup() {
+  UsbIo.begin();
+}
+
+void loop() {
+  UsbIo.poll();
+}
+```
+
 
 ## Installation
 
