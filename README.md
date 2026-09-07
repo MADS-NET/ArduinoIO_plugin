@@ -72,7 +72,7 @@ pin_modes = {"1"="OUTPUT", "2"="OUTPUT", "4"="PWM"}
 
 All settings are optional; if omitted, the default values are used.
 
-**NOTE**: currently, the plugin connects to the first available Arduino board found on the USB bus. In future releases, it will be possible to select a specific board by its serial number. if you **install** the plugin (`cmake --install build`), it also installs the `arduin0-io` command line utility, which can be used to test the plugin and to check the connected board. Just type `arduin0-io` to see the available commands.
+**NOTE**: currently, the plugin connects to the first available Arduino board found on the USB bus. In future releases, it will be possible to select a specific board by its serial number. if you **install** the plugin (`cmake --install build`), it also installs the `arduino-io` command line utility, which can be used to test the plugin and to check the connected board. Just type `arduino-io` to see the available commands.
 
 
 ## Executable demo
