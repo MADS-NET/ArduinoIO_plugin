@@ -1,0 +1,40 @@
+# director example configuration
+# Notes:
+# - [director] is optional global settings.
+# - Each top-level section name is the process name (mandatory).
+# - All options are shown below with defaults and purpose.
+
+[director] # optional: global director settings
+terminal = "" # optional, default="": terminal executable for detached attach windows
+sample_rate = 2.0 # optional, default=2.0: process metrics sampling period in seconds (fractions allowed)
+
+[broker] # process section name (mandatory)
+command = "mads broker" # mandatory: command line to execute
+# command supports variables: ${PWD}=resolved workdir, ${ID}=instance index (0-based)
+after = "" # optional, default="": start after this process name
+workdir = "" # optional, default="": working directory; default and relative paths resolve against the director.toml directory
+enabled = true # optional, default=true: when false, skip auto-start (manual start still allowed)
+scale = 1 # optional, default=1: number of instances to launch
+relaunch = true # optional, default=false: restart on non-zero exit status
+tty = true # optional, default=false: enable TTY/attach interaction
+# if workdir/.venv exists, director exposes it to launched Python commands
+
+[arduinousb_source]
+command = "mads source build/arduinousb.plugin -n arduinousb_source"
+after = "broker"
+workdir = ""
+enabled = true
+scale = 1
+relaunch = false
+tty = false
+
+[rerunner]
+command = "mads sink rerunner.plugin"
+after = "broker"
+workdir = ""
+enabled = false
+scale = 1
+relaunch = true
+tty = false
+
+

@@ -66,8 +66,8 @@ FetchContent_Declare(json
 
 set(ARDUINODRIVER_BUILD_CLI ON CACHE INTERNAL "")
 FetchContent_Declare(ArduinoDriver
-  GIT_REPOSITORY https://github.com/MADS-NET/ArduinoDriver.git
-  GIT_TAG v0.1.0
+  GIT_REPOSITORY https://github.com/pbosetti/ArduinoDriver.git
+  GIT_TAG v0.2.1
   GIT_SHALLOW TRUE
   EXCLUDE_FROM_ALL
 )
