@@ -25,87 +25,12 @@
 #include <arduino_driver/Device.h>
 #include <arduino_driver/Enumerator.h>
 #include <arduino_driver/Protocol.h>
+#include "usb_driver.hpp"
 
 // Load the namespaces
 using namespace std;
 using namespace ArduinoDriver;
 using json = nlohmann::json;
-
-
-class USBDriver {
-public:
-  const map<string, PinMode> modes{
-    {"INPUT", PinMode::Input},
-    {"OUTPUT", PinMode::Output},
-    {"PULLUP", PinMode::InputPullup},
-    {"PULLDOWN", PinMode::InputPulldown},
-    {"ANALOG", PinMode::AnalogIn},
-    {"PWM", PinMode::Pwm},
-    {"DAC", PinMode::Dac}
-  };
-
-  USBDriver() {
-    _dev = make_unique<Device>(open_first(_ctx));
-  }
-
-  USBDriver(string serial) {
-    _dev = make_unique<Device>(open_by_serial(_ctx, serial));
-  }
-
-  ~USBDriver() {
-    _dev.reset();
-    _dev.release();
-    _ctx.reset();
-  }
-
-  static string list_devices() {
-    auto ctx = std::make_shared<Context>();
-    string result;
-    EnumerateOptions enum_options;
-    enum_options.probe = true;
-    enum_options.probe_timeout = std::chrono::milliseconds(500);
-    auto devices = ::list_devices(ctx, enum_options);
-    for (const auto &dev : devices) {
-      if (!dev.identified) {
-        continue;
-      }
-      result += "- " + string(::board_name(dev.info->board_id)) + ", Serial: " + dev.serial + ", VID: " + to_string(dev.vid) + ", PID: " + to_string(dev.pid) + " "  + "\n";
-    }
-    return result;
-  }
-
-protected:
-  void read_pin_modes(json obj, const vector<string> &allowed_modes) {
-    if (!obj.is_object()) {
-      throw runtime_error("Pin modes must be a dictionary");
-    }
-    for (const auto &[pin, mode] : obj.items()) {
-      // read the pin number and mode from the json object
-      if (!mode.is_string()) {
-        throw runtime_error("Pin mode must be a string");
-      }
-      string mode_str = mode.get<string>();
-      if (modes.find(mode_str) == modes.end()) {
-        throw runtime_error("Invalid pin mode: " + mode_str);
-      }
-      if (!all_of(pin.begin(), pin.end(), ::isdigit)) {
-        throw runtime_error("Pin must be a number: " + pin);
-      }
-      if (find(allowed_modes.begin(), allowed_modes.end(), mode_str) == allowed_modes.end()) {
-        throw runtime_error("Pin mode not allowed: " + mode_str);
-      }
-      _pin_modes[stoi(pin)] = modes.at(mode_str);
-      _dev->pin_mode(stoi(pin), modes.at(mode_str));
-    }
-  }
-
-protected:
-  shared_ptr<Context> _ctx = std::make_shared<Context>();
-  unique_ptr<Device> _dev;
-  string _port{""};
-  map<uint8_t, PinMode> _pin_modes{};
-  bool _init_error{false};
-};
 
 
 // Plugin class. This shall be the only part that needs to be modified,
@@ -135,12 +60,17 @@ public:
     if (_init_error) return return_type::critical;
     out.clear();
 
-    for (const auto &[pin, mode] : _pin_modes) {
-      if (mode == PinMode::Input || mode == PinMode::InputPullup || mode == PinMode::InputPulldown) {
-        out["digital"][to_string(pin)] = _dev->digital_read(pin);
-      } else if (mode == PinMode::AnalogIn) {
-        out["analog"][to_string(pin)] = _dev->analog_read_volts(pin);
+    try {
+      for (const auto &[pin, mode] : _pin_modes) {
+        if (mode == PinMode::Input || mode == PinMode::InputPullup || mode == PinMode::InputPulldown) {
+          out["digital"][to_string(pin)] = _dev->digital_read(pin);
+        } else if (mode == PinMode::AnalogIn) {
+          out["analog"][to_string(pin)] = _dev->analog_read_volts(pin);
+        }
       }
+    } catch (const exception &e) {
+      _error = e.what();
+      return return_type::error;
     }
 
     if (!_agent_id.empty()) out["agent_id"] = _agent_id;
@@ -150,18 +80,21 @@ public:
   void set_params(const json &params) override {
     Source::set_params(params);
 
+    _params["serial"] = "";
     _params["pin_modes"] = json::object();
     _params["pin_modes"]["1"] = "PULLDOWN";
 
     _params.merge_patch(params);
 
     try {
+      open(_params["serial"].get<string>());
       read_pin_modes(_params["pin_modes"], _allowed_pin_modes);
-    } catch ( const runtime_error &e) {
+      apply_pin_modes();
+    } catch (const exception &e) {
+      _error = e.what();
       cerr << e.what() << endl;
       _init_error = true;
     }
-    
   }
 
   // Implement this method if you want to provide additional information
@@ -208,67 +141,76 @@ public:
       _error = "Input must be a JSON object";
       return return_type::error;
     }
-    if (input.contains("digital")) {
-      for (const auto &[pin_str, value] : input["digital"].items()) {
-        if (!all_of(pin_str.begin(), pin_str.end(), ::isdigit)) {
-          _error = "Pin must be a number: " + pin_str;
-          return return_type::error;
+    try {
+      if (input.contains("digital")) {
+        for (const auto &[pin_str, value] : input["digital"].items()) {
+          if (!all_of(pin_str.begin(), pin_str.end(), ::isdigit)) {
+            _error = "Pin must be a number: " + pin_str;
+            return return_type::error;
+          }
+          uint8_t pin = stoi(pin_str);
+          if (_pin_modes.find(pin) == _pin_modes.end() || _pin_modes[pin] != PinMode::Output) {
+            _error = "Pin not configured as OUTPUT: " + pin_str;
+            return return_type::error;
+          }
+          _dev->digital_write(pin, value.get<bool>());
         }
-        uint8_t pin = stoi(pin_str);
-        if (_pin_modes.find(pin) == _pin_modes.end() || _pin_modes[pin] != PinMode::Output) {
-          _error = "Pin not configured as OUTPUT: " + pin_str;
-          return return_type::error;
-        }
-        _dev->digital_write(pin, value.get<bool>());
       }
+      if (input.contains("pwm")) {
+        for (const auto &[pin_str, value] : input["pwm"].items()) {
+          if (!all_of(pin_str.begin(), pin_str.end(), ::isdigit)) {
+            _error = "Pin must be a number: " + pin_str;
+            return return_type::error;
+          }
+          uint8_t pin = stoi(pin_str);
+          if (_pin_modes.find(pin) == _pin_modes.end() || _pin_modes[pin] != PinMode::Pwm) {
+            _error = "Pin not configured as PWM: " + pin_str;
+            return return_type::error;
+          }
+          _dev->pwm_write_fraction(pin, value.get<double>());
+        }
+      }
+      if (input.contains("dac")) {
+        for (const auto &[pin_str, value] : input["dac"].items()) {
+          if (!all_of(pin_str.begin(), pin_str.end(), ::isdigit)) {
+            _error = "Pin must be a number: " + pin_str;
+            return return_type::error;
+          }
+          uint8_t pin = stoi(pin_str);
+          if (_pin_modes.find(pin) == _pin_modes.end() || _pin_modes[pin] != PinMode::Dac) {
+            _error = "Pin not configured as DAC: " + pin_str;
+            return return_type::error;
+          }
+          _dev->dac_write_volts(pin, value.get<double>());
+        }
+      }
+    } catch (const exception &e) {
+      _error = e.what();
+      return return_type::error;
     }
-    if (input.contains("pwm")) {
-      for (const auto &[pin_str, value] : input["pwm"].items()) {
-        if (!all_of(pin_str.begin(), pin_str.end(), ::isdigit)) {
-          _error = "Pin must be a number: " + pin_str;
-          return return_type::error;
-        }
-        uint8_t pin = stoi(pin_str);
-        if (_pin_modes.find(pin) == _pin_modes.end() || _pin_modes[pin] != PinMode::Pwm) {
-          _error = "Pin not configured as PWM: " + pin_str;
-          return return_type::error;
-        }
-        _dev->pwm_write(pin, value.get<double>());
-      }
-    }
-    if (input.contains("dac")) {
-      for (const auto &[pin_str, value] : input["dac"].items()) {
-        if (!all_of(pin_str.begin(), pin_str.end(), ::isdigit)) {
-          _error = "Pin must be a number: " + pin_str;
-          return return_type::error;
-        }
-        uint8_t pin = stoi(pin_str);
-        if (_pin_modes.find(pin) == _pin_modes.end() || _pin_modes[pin] != PinMode::Dac) {
-          _error = "Pin not configured as DAC: " + pin_str;
-          return return_type::error;
-        }
-        _dev->dac_write(pin, value.get<double>());
-      }
-    } 
     return return_type::success;
   }
 
-  void set_params(const json &params) override { 
-    // Call the parent class method to set the common parameters 
+  void set_params(const json &params) override {
+    // Call the parent class method to set the common parameters
     // (e.g. agent_id, etc.)
     Sink::set_params(params);
 
-    // provide sensible defaults for the parameters by setting e.g.
-    _params["some_field"] = "default_value";
-    
+    // provide sensible defaults for the parameters
+    _params["serial"] = "";
+    _params["pin_modes"] = json::object();
+
+    _params.merge_patch(params);
+
     try {
+      open(_params["serial"].get<string>());
       read_pin_modes(_params["pin_modes"], _allowed_pin_modes);
-    } catch ( const runtime_error &e) {
+      apply_pin_modes();
+    } catch (const exception &e) {
+      _error = e.what();
       cerr << e.what() << endl;
       _init_error = true;
     }
-    _params.merge_patch(params);
-    
   }
 
   // Implement this method if you want to provide additional information
@@ -316,7 +258,7 @@ int main(int argc, char const *argv[]) {
   try {
     cout << "Listing devices..." << endl;
     cout << USBDriver::list_devices() << endl;
-  } catch (const DeviceNotFound &e) {
+  } catch (const Error &e) {
     cerr << "Error: " << e.what() << endl;
   } 
   

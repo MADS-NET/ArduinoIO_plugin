@@ -67,7 +67,7 @@ FetchContent_Declare(json
 set(ARDUINODRIVER_BUILD_CLI ON CACHE INTERNAL "")
 FetchContent_Declare(ArduinoDriver
   GIT_REPOSITORY https://github.com/pbosetti/ArduinoDriver.git
-  GIT_TAG v0.2.1
+  GIT_TAG v0.2.2
   GIT_SHALLOW TRUE
   EXCLUDE_FROM_ALL
 )
@@ -142,6 +142,7 @@ include_directories(${json_SOURCE_DIR}/include)
 
 # These plugins are always build and use for testing
 add_plugin(arduinousb LIBS ArduinoDriver::arduino_driver)
+add_plugin(arduinostream LIBS ArduinoDriver::arduino_driver)
 
 # ArduinoDriver's CLI tool (arduino-io) lives in an EXCLUDE_FROM_ALL
 # subdirectory, so pull it back into the default build.

@@ -28,6 +28,22 @@ scale = 1
 relaunch = false
 tty = false
 
+# Bulk-stream source (UsbstreamPlugin). Do NOT enable this together with
+# arduinousb_source against the same board: as a separate process, the other
+# agent does not see this plugin's in-process DeviceBusy guard. Instead it
+# will either fail to open the board at all (its USB interface is already
+# claimed by the streaming process) or, if it does get through, stop this
+# stream with a PIN_MODE or RESET. Enable one or the other, never both,
+# unless they target different boards.
+[arduinostream]
+command = "mads source build/arduinostream.plugin"
+after = "broker"
+workdir = ""
+enabled = false
+scale = 1
+relaunch = false
+tty = false
+
 [rerunner]
 command = "mads sink rerunner.plugin"
 after = "broker"
