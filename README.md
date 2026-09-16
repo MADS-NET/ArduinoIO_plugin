@@ -215,10 +215,12 @@ were seen to die every few seconds with `LIBUSB_ERROR_IO` (macOS: "device not
 responding"), and occasionally the board stopped answering altogether until
 it was replugged, with the sketch itself still running. Larger bulk packets
 made it worse, pointing at bit errors on the link rather than at the firmware.
-Connecting the board through a **powered USB hub** removed the problem
-entirely: 10 x 60 s at 10 kHz with no failures. If you see these symptoms,
-put a powered hub between the computer and the board, and prefer a short
-cable.
+Connecting the board through a **USB hub** removed the problem entirely:
+10 x 60 s at 10 kHz with no failures, both with the hub's power adapter
+connected and without it. The hub retransmits every packet, splitting one
+marginal link into two short ones, while the board still runs at High Speed.
+If you see these symptoms, put a USB 2.0 or USB 3 hub (external power not
+needed) between the computer and the board, and prefer a short cable.
 
 ### Tips
 
