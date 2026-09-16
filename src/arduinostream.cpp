@@ -276,7 +276,10 @@ public:
   return_type get_output(json &out, vector<unsigned char> * /*blob*/ = nullptr) override {
     if (_init_error) return return_type::critical;
     if (!_stream->running()) {
-      _error = "stream stopped (device unplugged?)";
+      // Stream::error() says why the driver's worker gave up (e.g. a failed
+      // bulk IN transfer, or the device being unplugged).
+      const string why = _stream->error();
+      _error = "stream stopped: " + (why.empty() ? string("unknown reason") : why);
       return return_type::critical;
     }
 
@@ -381,6 +384,7 @@ public:
                         {"host_drops", stats.host_drops},
                         {"device_overruns", stats.device_overruns},
                         {"resyncs", stats.resyncs},
+                        {"stale_records", stats.stale_records},
                         {"records_received", stats.records_received}};
       qos["latency_ms"] = latency_ms;
       out["qos"] = std::move(qos);

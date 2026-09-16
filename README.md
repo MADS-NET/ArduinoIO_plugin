@@ -154,6 +154,7 @@ Note that `period` here is the agent's MADS loop period (how often
       "host_drops": 0,
       "device_overruns": 0,
       "resyncs": 0,
+      "stale_records": 0,
       "records_received": 15003
     },
     "latency_ms": 2.4
@@ -183,7 +184,9 @@ Note that `period` here is the agent's MADS loop period (how often
   Device overruns are already counted inside `seq_gaps`, so do not add them
   again when computing "records lost".
 - `qos.totals`: the same four counters as running totals since the stream
-  started, plus `records_received`.
+  started, plus `records_received` and `stale_records` (records left over in
+  the board's USB endpoint by an earlier session, which the driver
+  recognises by their timestamp and discards).
 - `qos.latency_ms`: how far behind wall-clock time the last sample in this
   frame is by the time the frame is built.
 - `time_ref`: anchors the device clock to the host clock, captured once when
@@ -198,8 +201,24 @@ Note that `period` here is the agent's MADS loop period (how often
 If `seq_gaps` or `host_drops` increased since the previous frame,
 `get_output()` returns `warning` — the frame is still published, with a
 message describing the loss attached under the `warning` key — instead of
-`success`. If the device is unplugged or the stream's worker thread dies,
-`get_output()` returns `critical` and the agent stops.
+`success`. If the stream stops (the device is unplugged, or a USB transfer
+fails), `get_output()` returns `critical` with the driver's reason, e.g.
+`stream stopped: bulk IN transfer failed: LIBUSB_ERROR_IO`, and the agent
+stops; restarting the agent (e.g. `relaunch = true` in `director.toml`) opens
+a clean session.
+
+### Troubleshooting: Portenta H7 and High Speed USB
+
+The Portenta H7 streams over a USB **High Speed** (480 Mbit/s) link, which is
+sensitive to signal quality. Plugged straight into a Mac's USB-C port, streams
+were seen to die every few seconds with `LIBUSB_ERROR_IO` (macOS: "device not
+responding"), and occasionally the board stopped answering altogether until
+it was replugged, with the sketch itself still running. Larger bulk packets
+made it worse, pointing at bit errors on the link rather than at the firmware.
+Connecting the board through a **powered USB hub** removed the problem
+entirely: 10 x 60 s at 10 kHz with no failures. If you see these symptoms,
+put a powered hub between the computer and the board, and prefer a short
+cable.
 
 ### Tips
 
