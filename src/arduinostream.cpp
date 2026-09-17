@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <future>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -80,6 +81,85 @@ struct TimeUnwrapper {
   bool first{true};
 };
 
+// SessionTimeline: places the records of every stream session (the first
+// one, and each one a restart opens) on the single t_us timeline the plugin
+// publishes, which never goes backwards.
+//
+// Within a session, t_us is the unwrapped device clock plus a constant
+// offset (0 for the first session). A session that finds the board still
+// running keeps the offset, so t_us stays the board's own clock across the
+// restart. A board that was reset (unplugged, power-cycled) restarted its
+// clock near zero: the offset is then recomputed so that t_us continues
+// where the host clock says it should, and the jump in t_us across the gap
+// matches the time that actually went by.
+//
+// Plain integers only, so the test main() can exercise it without a device.
+struct SessionTimeline {
+  // Starts a session from its anchor: the device clock (micros64) as read at
+  // host steady-clock time host_us, before the session's STREAM_START.
+  void start_session(std::uint64_t device_us, std::int64_t host_us) {
+    const auto dev = static_cast<std::int64_t>(device_us);
+    reset = false;
+    if (started) {
+      const std::int64_t host_elapsed = host_us - prev_host_us;
+      const std::int64_t dev_elapsed =
+          dev - static_cast<std::int64_t>(prev_device_us);
+      // A board that kept running advanced its clock with the host's, within
+      // crystal tolerance (200 ppm) and anchor uncertainty (50 ms).
+      reset = dev_elapsed < host_elapsed - host_elapsed / 5000 - 50000;
+      if (reset) {
+        offset = static_cast<std::int64_t>(prev_device_us) + offset +
+                 host_elapsed - dev;
+      }
+      // Every record of the new session is no older than its anchor, so this
+      // keeps t_us strictly increasing whatever the two clocks did.
+      if (have_last && dev + offset <= static_cast<std::int64_t>(last_t_us)) {
+        offset = static_cast<std::int64_t>(last_t_us) + 1 - dev;
+      }
+    }
+    started = true;
+    prev_device_us = device_us;
+    prev_host_us = host_us;
+  }
+
+  // Maps an unwrapped device timestamp of the current session onto t_us.
+  std::uint64_t map(std::uint64_t device_us) {
+    last_t_us = static_cast<std::uint64_t>(
+        static_cast<std::int64_t>(device_us) + offset);
+    have_last = true;
+    return last_t_us;
+  }
+
+  std::int64_t offset{0};
+  std::uint64_t last_t_us{0}; // last value map() returned
+  bool have_last{false};
+  bool reset{false}; // the last start_session() found the board reset
+  std::uint64_t prev_device_us{0};
+  std::int64_t prev_host_us{0};
+  bool started{false};
+};
+
+// Stream counters summed over every session: each Stream starts its own
+// StreamStats from zero.
+struct StreamTotals {
+  StreamTotals &operator+=(const StreamStats &s) {
+    seq_gaps += s.seq_gaps;
+    host_drops += s.host_drops;
+    device_overruns += s.device_overruns;
+    resyncs += s.resyncs;
+    stale_records += s.stale_records;
+    records_received += s.records_received;
+    return *this;
+  }
+
+  std::uint64_t seq_gaps{0};
+  std::uint64_t host_drops{0};
+  std::uint64_t device_overruns{0};
+  std::uint64_t resyncs{0};
+  std::uint64_t stale_records{0};
+  std::uint64_t records_received{0};
+};
+
 // Formats a system_clock time point as an ISO-8601 UTC string with
 // millisecond precision, e.g. "2026-09-16T10:11:12.345Z". Uses gmtime_s on
 // Windows and gmtime_r elsewhere, per the project's portability rule.
@@ -119,16 +199,27 @@ struct Channel {
 // endpoint (ArduinoDriver::Stream) instead of polling them one control
 // transfer at a time (that is what arduinousb.cpp's UsbsourcePlugin does).
 // See usb_driver.hpp for the USBDriver mixin this class shares with it.
+//
+// When the stream fails (a USB transfer error, the board unplugged), the
+// plugin publishes what the dead stream had already decoded, then reopens
+// the board and starts a new session on a background thread, retrying with
+// backoff until the board answers again (setting `restart`). The thread owns
+// _dev and _stream while it runs, so get_output() never blocks on USB.
 class UsbstreamPlugin : public Source<json>, public USBDriver {
 
 public:
   using Source::Source; // inherit constructors
 
-  // A Stream must not outlive the Device owned by the USBDriver base.
-  // Member destruction order already guarantees this (derived members are
-  // destroyed before base subobjects), but reset explicitly to make the
-  // requirement hold even if that ever changes.
-  ~UsbstreamPlugin() override { _stream.reset(); }
+  // A pending restart owns _dev and _stream on its own thread: wait for it
+  // first. Then stop the Stream before the USBDriver base destroys the Device
+  // it belongs to (member destruction order already guarantees this, but
+  // reset explicitly to make the requirement hold even if that ever changes).
+  ~UsbstreamPlugin() override {
+    if (_restart.valid()) {
+      _restart.wait();
+    }
+    _stream.reset();
+  }
 
   string kind() override { return PLUGIN_NAME; }
 
@@ -142,6 +233,8 @@ public:
     _params["buffer_size"] = 0;
     _params["chunk_size"] = 0;
     _params["volts"] = true;
+    _params["restart"] = true;
+    _params["max_restarts"] = 0;
 
     _params.merge_patch(params);
     // merge_patch merges JSON objects key by key; a user-supplied pin_modes
@@ -151,20 +244,11 @@ public:
     }
 
     try {
-      open(_params["serial"].get<string>());
-
-      if (!_dev->info().streaming()) {
-        throw runtime_error(
-            "Board " + string(board_name(_dev->info().board_id)) +
-            " does not support bulk streaming (USBIO_FLAG_STREAMING not set)");
-      }
-
       read_pin_modes(_params["pin_modes"], _allowed_pin_modes);
       if (_pin_modes.empty()) {
         throw runtime_error("pin_modes must not be empty: at least one "
                              "streamed pin is required");
       }
-      apply_pin_modes();
 
       double sample_rate = _params["sample_rate"].get<double>();
       if (sample_rate < 0.0) {
@@ -210,40 +294,27 @@ public:
                              to_string(buffer_size) + ")");
       }
 
-      // Anchor device time to host time BEFORE starting the stream: once the
-      // Stream runs, every other Device call (including read_time()) throws
-      // DeviceBusy. Take the steady/system clock pair together, right after,
-      // so the anchor's steady host_time can be mapped to a system_clock
-      // time for the ISO-8601 string below.
-      DeviceTime anchor = _dev->read_time();
-      auto steady_now = std::chrono::steady_clock::now();
-      auto system_now = std::chrono::system_clock::now();
-      _anchor = anchor;
-      auto anchor_system =
-          system_now + std::chrono::duration_cast<std::chrono::microseconds>(
-                            anchor.host_time - steady_now);
-      _time_ref = json{{"device_us", anchor.micros64},
-                        {"host", format_iso8601_utc(anchor_system)},
-                        {"uncertainty_us", anchor.round_trip.count() / 2}};
-
-      vector<uint8_t> pins;
-      pins.reserve(_pin_modes.size());
-      for (const auto &[pin, mode] : _pin_modes) {
-        pins.push_back(pin);
+      long long max_restarts = _params["max_restarts"].get<long long>();
+      if (max_restarts < 0) {
+        throw runtime_error("max_restarts must be >= 0 (got " +
+                             to_string(max_restarts) + ")");
       }
 
-      StreamConfig cfg;
-      cfg.pins = pins;
-      cfg.period = period;
-      cfg.flags = 0;
-      cfg.queue_capacity = static_cast<size_t>(buffer_size);
+      _cfg = StreamConfig{};
+      for (const auto &[pin, mode] : _pin_modes) {
+        _cfg.pins.push_back(pin);
+      }
+      _cfg.period = period;
+      _cfg.flags = 0;
+      _cfg.queue_capacity = static_cast<size_t>(buffer_size);
 
-      _stream.emplace(_dev->start_stream(cfg));
+      _serial = find_serial(_params["serial"].get<string>());
+      start_timeline(start_session());
 
       // Precompute the per-channel layout once, from the Stream's own pin
-      // order (== `pins` above, but this is the authoritative source): the
-      // hot path in get_output() then indexes straight into _channels[j]
-      // instead of looking `s.pin` up in _pin_modes for every sample.
+      // order (== _cfg.pins, but this is the authoritative source): the hot
+      // path in get_output() then indexes straight into _channels[j] instead
+      // of looking `s.pin` up in _pin_modes for every sample.
       const auto &stream_pins = _stream->pins();
       _channels.clear();
       _channels.reserve(stream_pins.size());
@@ -252,18 +323,18 @@ public:
             Channel{to_string(pin), _pin_modes.at(pin) == PinMode::AnalogIn});
       }
 
-      _n_pins = pins.size();
+      _n_pins = _channels.size();
       _staging.assign(static_cast<size_t>(buffer_size) * _n_pins, Sample{});
+      _staging_t.assign(static_cast<size_t>(buffer_size), 0);
       _staged = 0;
-
-      _unwrapper.seed(anchor.micros64);
-      _last_stats = StreamStats{};
 
       _sample_rate = sample_rate;
       _period_us = period_us;
       _buffer_size = static_cast<size_t>(buffer_size);
       _chunk_size = static_cast<size_t>(chunk_size);
       _volts = _params["volts"].get<bool>();
+      _restart_enabled = _params["restart"].get<bool>();
+      _max_restarts = static_cast<uint64_t>(max_restarts);
     } catch (const exception &e) {
       _error = e.what();
       cerr << e.what() << endl;
@@ -272,44 +343,75 @@ public:
   }
 
   // Never blocks: drains whatever the Stream worker already decoded with
-  // timeout 0, then either publishes a chunk or returns retry.
+  // timeout 0, then either publishes a chunk or returns retry. A restart
+  // runs on its own thread; while it does, this only publishes records that
+  // are already staged.
   return_type get_output(json &out, vector<unsigned char> * /*blob*/ = nullptr) override {
     if (_init_error) return return_type::critical;
-    if (!_stream->running()) {
-      // Stream::error() says why the driver's worker gave up (e.g. a failed
-      // bulk IN transfer, or the device being unplugged).
-      const string why = _stream->error();
-      _error = "stream stopped: " + (why.empty() ? string("unknown reason") : why);
-      return return_type::critical;
-    }
-
     out.clear();
+    next_loop_duration = std::chrono::milliseconds(0);
 
     try {
-      // 1. Drain the Stream's internal queue without blocking.
-      while (_staged < _staging.size()) {
-        std::span<Sample> free_tail(_staging.data() + _staged,
-                                    _staging.size() - _staged);
-        size_t n = _stream->read(free_tail, std::chrono::milliseconds(0));
-        if (n == 0) break;
-        _staged += n;
+      // 1. Collect a finished restart attempt, or start the next one once
+      // the backoff after a failed attempt has expired.
+      if (_restart.valid() &&
+          _restart.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+          !finish_restart()) {
+        return return_type::error;
+      }
+      if (!_restart.valid() && !_stream &&
+          std::chrono::steady_clock::now() >= _next_attempt) {
+        launch_restart();
+      }
+
+      // 2. Drain the Stream's queue without blocking. A stopped Stream still
+      // hands out what it decoded before stopping, so only once that is all
+      // staged does the plugin restart it (or give up on it).
+      if (!_restart.valid() && _stream && _fatal.empty()) {
+        const bool alive = _stream->running();
+        if (drain() && !alive) {
+          const string why = _stream->error();
+          _failure = why.empty() ? string("unknown reason") : why;
+          if (_restart_enabled &&
+              (_max_restarts == 0 || _restarts < _max_restarts)) {
+            _base += _stream->stats();
+            cerr << "arduinostream: stream stopped (" << _failure
+                 << "), restarting" << endl;
+            launch_restart();
+          } else {
+            _fatal = "stream stopped: " + _failure;
+            if (_restart_enabled) {
+              _fatal += " (max_restarts = " + to_string(_max_restarts) +
+                        " reached)";
+            }
+          }
+        }
       }
 
       size_t records_staged = _staged / _n_pins;
+      if (!_fatal.empty() && records_staged == 0) {
+        _error = _fatal;
+        return return_type::critical;
+      }
+      // A stream that will not come back publishes its last records even
+      // when they are fewer than chunk_size.
       if (records_staged == 0 ||
-          (_chunk_size > 0 && records_staged < _chunk_size)) {
+          (_chunk_size > 0 && records_staged < _chunk_size && _fatal.empty())) {
         return return_type::retry;
       }
 
-      size_t K = _chunk_size > 0 ? _chunk_size : records_staged;
+      size_t K = (_chunk_size > 0 && records_staged >= _chunk_size)
+                     ? _chunk_size
+                     : records_staged;
 
-      // 2. Build columns from the first K records. One native vector per
+      // 3. Build columns from the first K records. One native vector per
       // channel, pre-reserved and filled by index (no _pin_modes lookup and
       // no map insertion per sample: at 10 kHz x 8 channels that used to be
       // ~160k map ops/tick). Moved into `out` once each at the end, since
       // frames may hold up to 10k records and growing a json array one
       // push_back() at a time is far slower than building a vector first.
-      vector<uint64_t> t_us_vec(K);
+      vector<uint64_t> t_us_vec(_staging_t.begin(),
+                                _staging_t.begin() + static_cast<std::ptrdiff_t>(K));
       vector<vector<double>> analog_volts_cols(_n_pins);
       vector<vector<uint16_t>> analog_raw_cols(_n_pins);
       vector<vector<int>> digital_cols(_n_pins);
@@ -324,7 +426,6 @@ public:
 
       for (size_t i = 0; i < K; ++i) {
         const Sample *record = &_staging[i * _n_pins];
-        t_us_vec[i] = _unwrapper.unwrap(record[0].t_us);
         for (size_t j = 0; j < _n_pins; ++j) {
           const Sample &s = record[j];
           if (_channels[j].analog) {
@@ -350,24 +451,32 @@ public:
         }
       }
 
-      // 3. QoS: rate actually achieved, loss counters (delta since the
-      // previous frame, plus running totals) and publish latency.
+      // 4. QoS: rate actually achieved, loss and restart counters (delta
+      // since the previous frame, plus running totals) and publish latency.
       double rate_hz = 0.0;
       if (K >= 2 && t_last > t_first) {
         rate_hz = static_cast<double>(K - 1) * 1.0e6 /
                   static_cast<double>(t_last - t_first);
       }
 
-      StreamStats stats = _stream->stats();
+      // While a restart runs, its thread owns _stream: the dead session's
+      // counters are already in _base.
+      StreamTotals totals = _base;
+      if (_stream && !_restart.valid()) {
+        totals += _stream->stats();
+      }
       // device_overruns are also counted in seq_gaps (see StreamStats), so
       // "lost records" below sums seq_gaps + host_drops only, not overruns.
-      uint32_t d_overruns = stats.device_overruns - _last_stats.device_overruns;
-      uint64_t d_seq_gaps = stats.seq_gaps - _last_stats.seq_gaps;
-      uint64_t d_host_drops = stats.host_drops - _last_stats.host_drops;
-      uint64_t d_resyncs = stats.resyncs - _last_stats.resyncs;
+      uint64_t d_overruns = totals.device_overruns - _last_totals.device_overruns;
+      uint64_t d_seq_gaps = totals.seq_gaps - _last_totals.seq_gaps;
+      uint64_t d_host_drops = totals.host_drops - _last_totals.host_drops;
+      uint64_t d_resyncs = totals.resyncs - _last_totals.resyncs;
+      uint64_t d_restarts = _restarts - _last_restarts;
+      uint64_t d_gap_us = _gap_us - _last_gap_us;
+      uint64_t d_gap_records = _gap_records - _last_gap_records;
 
       int64_t delta_us =
-          static_cast<int64_t>(t_last) - static_cast<int64_t>(_anchor.micros64);
+          static_cast<int64_t>(t_last) - static_cast<int64_t>(_anchor_t_us);
       auto host_time_last = _anchor.host_time + std::chrono::microseconds(delta_us);
       double latency_ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - host_time_last)
@@ -380,38 +489,72 @@ public:
       qos["host_drops"] = d_host_drops;
       qos["device_overruns"] = d_overruns;
       qos["resyncs"] = d_resyncs;
-      qos["totals"] = {{"seq_gaps", stats.seq_gaps},
-                        {"host_drops", stats.host_drops},
-                        {"device_overruns", stats.device_overruns},
-                        {"resyncs", stats.resyncs},
-                        {"stale_records", stats.stale_records},
-                        {"records_received", stats.records_received}};
+      qos["restarts"] = d_restarts;
+      qos["gap_us"] = d_gap_us;
+      qos["totals"] = {{"seq_gaps", totals.seq_gaps},
+                        {"host_drops", totals.host_drops},
+                        {"device_overruns", totals.device_overruns},
+                        {"resyncs", totals.resyncs},
+                        {"stale_records", totals.stale_records},
+                        {"records_received", totals.records_received},
+                        {"restarts", _restarts},
+                        {"gap_us", _gap_us}};
       qos["latency_ms"] = latency_ms;
       out["qos"] = std::move(qos);
       out["time_ref"] = _time_ref;
 
-      _last_stats = stats;
+      _last_totals = totals;
+      _last_restarts = _restarts;
+      _last_gap_us = _gap_us;
+      _last_gap_records = _gap_records;
 
-      // 4. Shift the leftover (unconsumed) samples to the front.
+      // 5. Shift the leftover (unconsumed) records to the front.
       size_t consumed = K * _n_pins;
-      std::copy(_staging.begin() + consumed, _staging.begin() + _staged,
+      std::copy(_staging.begin() + static_cast<std::ptrdiff_t>(consumed),
+                _staging.begin() + static_cast<std::ptrdiff_t>(_staged),
                 _staging.begin());
+      std::copy(_staging_t.begin() + static_cast<std::ptrdiff_t>(K),
+                _staging_t.begin() + static_cast<std::ptrdiff_t>(records_staged),
+                _staging_t.begin());
       _staged -= consumed;
 
       size_t remaining_records = _staged / _n_pins;
-      next_loop_duration = (_chunk_size > 0 && remaining_records >= _chunk_size)
-                                ? std::chrono::milliseconds(1)
-                                : std::chrono::milliseconds(0);
+      if ((_chunk_size > 0 && remaining_records >= _chunk_size) ||
+          (!_fatal.empty() && remaining_records > 0)) {
+        next_loop_duration = std::chrono::milliseconds(1);
+      }
 
       if (!_agent_id.empty()) out["agent_id"] = _agent_id;
 
+      vector<string> notes;
+      if (d_restarts > 0) {
+        ostringstream oss;
+        if (d_restarts > 1) {
+          oss << "stream restarted " << d_restarts << " times, last after: ";
+        } else {
+          oss << "stream restarted after: ";
+        }
+        oss << _failure << " (gap " << fixed << setprecision(1)
+            << static_cast<double>(d_gap_us) / 1000.0 << " ms";
+        if (_period_us > 0) {
+          oss << ", ~" << d_gap_records << " records missed";
+        }
+        oss << ")";
+        notes.push_back(oss.str());
+      }
       uint64_t lost = d_seq_gaps + d_host_drops;
       if (lost > 0) {
         ostringstream oss;
         oss << "lost " << lost << " records (seq gaps " << d_seq_gaps
             << ", host drops " << d_host_drops << ", device overruns "
             << d_overruns << ")";
-        _error = oss.str();
+        notes.push_back(oss.str());
+      }
+      if (!notes.empty()) {
+        _error = notes.front();
+        for (size_t i = 1; i < notes.size(); ++i) {
+          _error += "; " + notes[i];
+        }
         return return_type::warning;
       }
       return return_type::success;
@@ -431,7 +574,7 @@ public:
 
     map<string, string> result;
     result["board"] = string(board_name(_dev->info().board_id));
-    result["serial"] = _params.value("serial", "");
+    result["serial"] = _serial.empty() ? string("(none: first device)") : _serial;
     result["pin modes"] = _params["pin_modes"].dump();
     result["sample_rate"] =
         (_sample_rate > 0.0 ? to_string(_sample_rate) + " Hz" : "0 (free-running)");
@@ -440,6 +583,11 @@ public:
     result["buffer_size"] = to_string(_buffer_size);
     result["chunk_size"] = to_string(_chunk_size);
     result["volts"] = _volts ? "true" : "false";
+    result["restart"] =
+        !_restart_enabled ? string("off")
+        : _max_restarts == 0
+            ? string("on, unlimited")
+            : "on, at most " + to_string(_max_restarts);
 
     double rate_for_note = _sample_rate > 0.0 ? _sample_rate : 10000.0;
     double buffer_ms = static_cast<double>(_buffer_size) * 1000.0 / rate_for_note;
@@ -454,10 +602,149 @@ public:
   };
 
 private:
+  // The serial number of the board to stream from, so that a restart reopens
+  // that same board even when `serial` is empty ("first device"). Returns ""
+  // when no board is identified, or the first one has no readable serial:
+  // open() then falls back to the first device, and reports why none opened.
+  string find_serial(const string &configured) {
+    if (!configured.empty()) {
+      return configured;
+    }
+    for (const auto &device :
+         ArduinoDriver::list_devices(_ctx, ArduinoDriver::EnumerateOptions{})) {
+      if (device.identified) {
+        return device.serial;
+      }
+    }
+    return "";
+  }
+
+  // Opens the board and starts a stream session: (re)creates _dev and
+  // _stream from _serial, _pin_modes and _cfg, and returns the clock anchor
+  // read just before STREAM_START. Runs in set_params() for the first
+  // session and on the restart thread for every later one.
+  DeviceTime start_session() {
+    _stream.reset(); // a dead stream: joins its worker, STREAM_STOP if possible
+    _dev.reset();
+    open(_serial);
+    if (!_dev->info().streaming()) {
+      throw runtime_error(
+          "Board " + string(board_name(_dev->info().board_id)) +
+          " does not support bulk streaming (USBIO_FLAG_STREAMING not set)");
+    }
+    apply_pin_modes(); // a replugged board has lost them
+    // Anchor device time to host time BEFORE starting the stream: once the
+    // Stream runs, every other Device call (including read_time()) throws
+    // DeviceBusy.
+    DeviceTime anchor = _dev->read_time();
+    _stream.emplace(_dev->start_stream(_cfg));
+    return anchor;
+  }
+
+  // Puts a new session on the t_us timeline and publishes its anchor as
+  // time_ref. Main thread only.
+  void start_timeline(const DeviceTime &anchor) {
+    using namespace std::chrono;
+    _timeline.start_session(
+        anchor.micros64,
+        duration_cast<microseconds>(anchor.host_time.time_since_epoch()).count());
+    _unwrapper.seed(anchor.micros64);
+    _anchor = anchor;
+    _anchor_t_us = static_cast<uint64_t>(
+        static_cast<int64_t>(anchor.micros64) + _timeline.offset);
+
+    // Take the steady/system clock pair together, so the anchor's steady
+    // host_time can be mapped to a system_clock time for the ISO-8601 string.
+    auto steady_now = steady_clock::now();
+    auto system_now = system_clock::now();
+    auto anchor_system =
+        system_now + duration_cast<microseconds>(anchor.host_time - steady_now);
+    _time_ref = json{{"t_us", _anchor_t_us},
+                     {"device_us", anchor.micros64},
+                     {"host", format_iso8601_utc(anchor_system)},
+                     {"uncertainty_us", anchor.round_trip.count() / 2}};
+  }
+
+  // Moves whatever the Stream has decoded into the staging buffers, without
+  // blocking, and gives each record its t_us. Returns true when the Stream's
+  // queue is empty, false when staging filled up first.
+  bool drain() {
+    while (_staged < _staging.size()) {
+      std::span<Sample> free_tail(_staging.data() + _staged,
+                                  _staging.size() - _staged);
+      const size_t n = _stream->read(free_tail, std::chrono::milliseconds(0));
+      if (n == 0) {
+        return true;
+      }
+      // read() copies whole records only.
+      for (size_t i = _staged; i < _staged + n; i += _n_pins) {
+        const bool had_last = _timeline.have_last;
+        const uint64_t prev_t = _timeline.last_t_us;
+        const uint64_t t = _timeline.map(_unwrapper.unwrap(_staging[i].t_us));
+        if (_gap_pending) {
+          // First record after a restart: measure the hole it closes.
+          _gap_pending = false;
+          if (had_last) {
+            const uint64_t gap = t - prev_t;
+            _gap_us += gap;
+            if (_period_us > 0) {
+              const uint64_t period = static_cast<uint64_t>(_period_us);
+              const uint64_t steps = (gap + period / 2) / period;
+              _gap_records += steps > 0 ? steps - 1 : 0;
+            }
+          }
+        }
+        _staging_t[i / _n_pins] = t;
+      }
+      _staged += n;
+    }
+    return false;
+  }
+
+  void launch_restart() {
+    _restart = std::async(std::launch::async, [this] { return start_session(); });
+  }
+
+  // Collects a finished restart attempt. On success the new session goes on
+  // the timeline; on failure the next attempt is scheduled with backoff
+  // (0.5, 1, 2, 4, then every 5 s), _error says why, and false is returned.
+  bool finish_restart() {
+    DeviceTime anchor;
+    try {
+      anchor = _restart.get();
+    } catch (const exception &e) {
+      ++_failed_attempts;
+      const unsigned doublings = std::min(_failed_attempts - 1, 4u);
+      const auto delay = std::min(std::chrono::milliseconds(500 << doublings),
+                                  std::chrono::milliseconds(5000));
+      _next_attempt = std::chrono::steady_clock::now() + delay;
+      ostringstream oss;
+      oss << "stream restart attempt " << _failed_attempts << " failed: "
+          << e.what() << "; next attempt in " << fixed << setprecision(1)
+          << static_cast<double>(delay.count()) / 1000.0
+          << " s (stream stopped: " << _failure << ")";
+      _error = oss.str();
+      cerr << "arduinostream: " << _error << endl;
+      return false;
+    }
+    _failed_attempts = 0;
+    ++_restarts;
+    start_timeline(anchor);
+    _gap_pending = true;
+    cerr << "arduinostream: stream restarted"
+         << (_timeline.reset ? " (the board was reset: t_us bridged with host time)"
+                             : "")
+         << endl;
+    return true;
+  }
+
   const vector<string> _allowed_pin_modes{"ANALOG", "INPUT", "PULLUP", "PULLDOWN"};
 
   optional<Stream> _stream;
+  StreamConfig _cfg;
+  string _serial;
   vector<Sample> _staging;
+  vector<uint64_t> _staging_t; // t_us of each staged record
   vector<Channel> _channels;
   size_t _staged{0};
   size_t _n_pins{0};
@@ -467,10 +754,29 @@ private:
   int _period_us{0};
   bool _volts{true};
 
-  DeviceTime _anchor{};
+  DeviceTime _anchor{};      // anchor of the current session
+  uint64_t _anchor_t_us{0};  // _anchor.micros64 on the t_us timeline
   TimeUnwrapper _unwrapper{};
-  StreamStats _last_stats{};
+  SessionTimeline _timeline{};
   json _time_ref;
+
+  StreamTotals _base{};        // counters of the sessions that ended
+  StreamTotals _last_totals{}; // totals as of the previous frame
+
+  bool _restart_enabled{true};
+  uint64_t _max_restarts{0};
+  std::future<DeviceTime> _restart; // valid while an attempt runs or awaits collection
+  std::chrono::steady_clock::time_point _next_attempt{};
+  unsigned _failed_attempts{0};
+  string _failure; // why the last stream stopped
+  string _fatal;   // set when a stopped stream will not be restarted
+  uint64_t _restarts{0};
+  uint64_t _last_restarts{0};
+  uint64_t _gap_us{0};
+  uint64_t _last_gap_us{0};
+  uint64_t _gap_records{0};
+  uint64_t _last_gap_records{0};
+  bool _gap_pending{false};
 };
 
 
@@ -495,15 +801,99 @@ MADS_REGISTER_PLUGINS(UsbstreamPlugin)
 
 For testing purposes, when directly executing the plugin.
 
-Always runs the TimeUnwrapper checks (no hardware needed). With --offline,
-stops there. Otherwise looks for a streaming-capable device and, if found,
-exercises get_output() over the bulk stream at chunk_size = 0 and then at
-chunk_size = 50; if no device streams, prints SKIPPED and exits 0.
+Always runs the TimeUnwrapper and SessionTimeline checks (no hardware
+needed). With --offline, stops there. With --soak SECONDS, runs soak() below
+instead of the hardware checks. Otherwise looks for a streaming-capable
+device and, if found, exercises get_output() over the bulk stream at
+chunk_size = 0 and then at chunk_size = 50; if no device streams, prints
+SKIPPED and exits 0.
 */
+
+// Streams pins 15 and 16 at 10 kHz for `seconds`, calling get_output() every
+// 100 ms as an agent would, and prints every warning and error. Checks what
+// must hold across stream restarts: no critical, t_us strictly increasing
+// from frame to frame, qos.totals never decreasing. Meant for a link that
+// fails (e.g. a Portenta H7 plugged straight into a Mac), and for unplugging
+// and replugging the board while it runs.
+static int soak(double seconds) {
+  using namespace std::chrono;
+  UsbstreamPlugin plugin;
+  json params;
+  params["pin_modes"]["15"] = "ANALOG";
+  params["pin_modes"]["16"] = "ANALOG";
+  params["sample_rate"] = 10000.0;
+  plugin.set_params(params);
+
+  const auto start = steady_clock::now();
+  const auto deadline = start + duration_cast<steady_clock::duration>(
+                                    duration<double>(seconds));
+  auto stamp = [&] {
+    ostringstream oss;
+    oss << fixed << setprecision(1)
+        << duration<double>(steady_clock::now() - start).count() << " s";
+    return oss.str();
+  };
+
+  bool ok = true;
+  uint64_t frames = 0, records = 0, warnings = 0, errors = 0, last_t = 0;
+  json last_totals;
+  while (steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(milliseconds(100));
+    json out;
+    const return_type rt = plugin.get_output(out);
+    if (rt == return_type::critical) {
+      cerr << stamp() << " FAIL: critical: " << plugin.error() << endl;
+      ok = false;
+      break;
+    }
+    if (rt == return_type::error) {
+      ++errors;
+      cout << stamp() << " error: " << plugin.error() << endl;
+      continue;
+    }
+    if (rt == return_type::retry) {
+      continue;
+    }
+    if (rt == return_type::warning) {
+      ++warnings;
+      cout << stamp() << " warning: " << plugin.error() << endl;
+    }
+    ++frames;
+    for (const auto &tv : out["t_us"]) {
+      const uint64_t t = tv.get<uint64_t>();
+      if (records > 0 && t <= last_t) {
+        cerr << stamp() << " FAIL: t_us went from " << last_t << " to " << t
+             << endl;
+        ok = false;
+      }
+      last_t = t;
+      ++records;
+    }
+    const json &totals = out["qos"]["totals"];
+    if (!last_totals.is_null()) {
+      for (const auto &[key, value] : totals.items()) {
+        if (value.get<uint64_t>() < last_totals[key].get<uint64_t>()) {
+          cerr << stamp() << " FAIL: qos.totals." << key << " decreased" << endl;
+          ok = false;
+        }
+      }
+    }
+    last_totals = totals;
+  }
+
+  cout << "SOAK: " << frames << " frames, " << records << " records, "
+       << warnings << " warnings, " << errors << " errors; totals "
+       << last_totals.dump() << endl;
+  cout << (ok ? "SOAK PASSED" : "SOAK FAILED") << endl;
+  return ok ? 0 : 1;
+}
+
 int main(int argc, char const *argv[]) {
   bool offline = false;
+  double soak_seconds = 0.0;
   for (int i = 1; i < argc; ++i) {
     if (string(argv[i]) == "--offline") offline = true;
+    if (string(argv[i]) == "--soak" && i + 1 < argc) soak_seconds = stod(argv[++i]);
   }
 
   bool all_ok = true;
@@ -546,6 +936,53 @@ int main(int argc, char const *argv[]) {
           a == ((uint64_t{5} << 32) | 0x200ull));
   }
 
+  // ---- SessionTimeline checks (pure, no hardware) ------------------------
+  {
+    SessionTimeline tl;
+    tl.start_session(1'000'000, 0);
+    check("SessionTimeline: first session is the device clock",
+          tl.map(1'000'100) == 1'000'100 && !tl.reset);
+  }
+  {
+    // The board kept running through a 2 s outage: t_us stays its clock.
+    SessionTimeline tl;
+    tl.start_session(1'000'000, 0);
+    tl.map(5'000'000);
+    tl.start_session(7'000'000, 6'000'000);
+    check("SessionTimeline: restart on a running board keeps the device clock",
+          !tl.reset && tl.map(7'000'100) == 7'000'100);
+  }
+  {
+    // An hour at 83 ppm of drift is not a reset.
+    SessionTimeline tl;
+    tl.start_session(0, 0);
+    tl.map(3'599'000'000);
+    tl.start_session(3'599'700'000, 3'600'000'000);
+    check("SessionTimeline: clock drift within tolerance is not a reset",
+          !tl.reset && tl.map(3'599'700'100) == 3'599'700'100);
+  }
+  {
+    // Replugged: the board rebooted and its clock restarted at 2 s, 31 s
+    // after the previous anchor. t_us continues on the host's timeline.
+    SessionTimeline tl;
+    tl.start_session(60'000'000, 0);
+    tl.map(90'000'000);
+    tl.start_session(2'000'000, 31'000'000);
+    check("SessionTimeline: a board reset bridges the gap with host time",
+          tl.reset && tl.map(2'000'000) == 91'000'000 &&
+              tl.map(2'000'100) == 91'000'100);
+  }
+  {
+    // Host time says less went by than the old session's own records:
+    // t_us must still move forward.
+    SessionTimeline tl;
+    tl.start_session(1'000'000, 0);
+    tl.map(11'000'000);
+    tl.start_session(500'000, 5'000'000);
+    check("SessionTimeline: t_us never goes backwards",
+          tl.reset && tl.map(500'000) == 11'000'001);
+  }
+
   if (!all_ok) {
     cerr << "Pure checks FAILED" << endl;
     return 1;
@@ -554,6 +991,9 @@ int main(int argc, char const *argv[]) {
 
   if (offline) {
     return 0;
+  }
+  if (soak_seconds > 0.0) {
+    return soak(soak_seconds);
   }
 
   // ---- Hardware checks (skipped when no streaming device is attached) ---

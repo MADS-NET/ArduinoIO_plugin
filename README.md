@@ -102,8 +102,9 @@ MADS agent is a separate process with its own `Device` and does not see it.
 In practice, another agent pointed at the *same* board either fails to open
 it at all (its USB interface is already claimed by the streaming process),
 or — if it does get through — its `PIN_MODE` on a streamed pin, or a
-`RESET`, stops this plugin's stream (this plugin's next `get_output()` then
-returns `critical`). Run only one of
+`RESET`, stops the stream on the board. This plugin then simply receives no
+more records: the driver does not notice that the board stopped streaming,
+so it neither restarts the stream nor reports an error. Run only one of
 `arduinousb_source`/`arduinousb_sink`/`arduinostream` against a given board
 at a time — see the comment next to `[arduinostream]` in `director.toml`.
 
@@ -118,6 +119,8 @@ pin_modes = {"15"="ANALOG", "16"="ANALOG"}
 # chunk_size = 0    # records per published frame; 0 = publish everything staged each tick
 # volts = true      # analog samples as volts (true) or raw ADC codes (false)
 # serial = ""       # USB serial number to open; empty = first device found
+# restart = true    # reopen the board and resume streaming when the stream fails
+# max_restarts = 0  # stream failures to recover from; 0 = unlimited
 ```
 
 | Key | Type | Default | Meaning |
@@ -128,6 +131,8 @@ pin_modes = {"15"="ANALOG", "16"="ANALOG"}
 | `buffer_size` | int, records | `0` (auto) | Host-side queue capacity (`StreamConfig::queue_capacity`). `0` = `max(1024, ceil(sample_rate * 1 s))`, assuming 10000 Hz when free-running. On overflow the oldest record is dropped and counted as a host drop. |
 | `chunk_size` | int, records | `0` | `0` = publish every record staged since the last tick (a variable-size frame). `N` = publish exactly `N` records per frame, holding any extra for the next tick. |
 | `volts` | bool | `true` | Analog samples as volts (`true`) or raw ADC codes (`false`). |
+| `restart` | bool | `true` | When the stream fails, reopen the board and start a new stream instead of stopping the agent. See [Stream failures and restarts](#stream-failures-and-restarts). |
+| `max_restarts` | int | `0` | How many stream failures to recover from; the next one stops the agent. `0` = unlimited. Attempts to reopen a board that is not answering do not count. |
 
 Note that `period` here is the agent's MADS loop period (how often
 `get_output()` runs) — a reserved key handled by the host agent, unrelated to
@@ -149,17 +154,22 @@ Note that `period` here is the agent's MADS loop period (how often
     "host_drops": 0,
     "device_overruns": 0,
     "resyncs": 0,
+    "restarts": 0,
+    "gap_us": 0,
     "totals": {
       "seq_gaps": 0,
       "host_drops": 0,
       "device_overruns": 0,
       "resyncs": 0,
       "stale_records": 0,
-      "records_received": 15003
+      "records_received": 15003,
+      "restarts": 0,
+      "gap_us": 0
     },
     "latency_ms": 2.4
   },
   "time_ref": {
+    "t_us": 998531,
     "device_us": 998531,
     "host": "2026-09-16T10:11:12.345Z",
     "uncertainty_us": 350
@@ -169,7 +179,9 @@ Note that `period` here is the agent's MADS loop period (how often
 ```
 
 - `t_us`: device `micros()` for each record, unwrapped past the
-  ~71.6-minute `uint32` rollover into a monotonically increasing `uint64`.
+  ~71.6-minute `uint32` rollover into a `uint64` that only ever increases,
+  also across stream restarts. It stays the board's own clock until the
+  board is reset (see [Stream failures and restarts](#stream-failures-and-restarts)).
 - `analog` / `digital`: one array per streamed pin, `qos.records` values
   long, aligned with `t_us`. Pins in `ANALOG` mode go under `analog`; pins in
   `INPUT`/`PULLUP`/`PULLDOWN` mode go under `digital` as 0/1.
@@ -183,29 +195,62 @@ Note that `period` here is the agent's MADS loop period (how often
   device-side ADC/USB overruns, and byte-stream resyncs, respectively.
   Device overruns are already counted inside `seq_gaps`, so do not add them
   again when computing "records lost".
-- `qos.totals`: the same four counters as running totals since the stream
-  started, plus `records_received` and `stale_records` (records left over in
-  the board's USB endpoint by an earlier session, which the driver
-  recognises by their timestamp and discards).
+- `qos.restarts` / `qos.gap_us`: stream restarts since the previous frame,
+  and the time they left without records, from the last record before each
+  failure to the first one after it. The records missed in that gap are
+  not in `seq_gaps`: each new stream counts from zero.
+- `qos.totals`: the counters above as running totals since the agent
+  started, summed over every stream session, plus `records_received` and
+  `stale_records` (records left over in the board's USB endpoint by an
+  earlier session, which the driver recognises by their timestamp and
+  discards).
 - `qos.latency_ms`: how far behind wall-clock time the last sample in this
   frame is by the time the frame is built.
-- `time_ref`: anchors the device clock to the host clock, captured once when
-  the stream starts. `device_us` is the device's `micros()` at that instant,
-  `host` its ISO-8601 UTC equivalent (millisecond precision), and
-  `uncertainty_us` is half the round-trip time of the control transfer used
-  to measure it. The absolute time of sample `i` is
-  `time_ref.host + (t_us[i] - time_ref.device_us)` microseconds.
+- `time_ref`: anchors the stream's clock to the host clock, captured when
+  the stream starts and again at every restart. `t_us` is the value on the
+  `t_us` timeline at that instant, `device_us` the board's raw `micros()`
+  (the two differ only after a board reset), `host` their ISO-8601 UTC
+  equivalent (millisecond precision), and `uncertainty_us` half the
+  round-trip time of the control transfer used to measure it. The absolute
+  time of sample `i` is `time_ref.host + (t_us[i] - time_ref.t_us)`
+  microseconds.
 
 ### Loss and errors
 
 If `seq_gaps` or `host_drops` increased since the previous frame,
 `get_output()` returns `warning` — the frame is still published, with a
 message describing the loss attached under the `warning` key — instead of
-`success`. If the stream stops (the device is unplugged, or a USB transfer
-fails), `get_output()` returns `critical` with the driver's reason, e.g.
-`stream stopped: bulk IN transfer failed: LIBUSB_ERROR_IO`, and the agent
-stops; restarting the agent (e.g. `relaunch = true` in `director.toml`) opens
-a clean session.
+`success`.
+
+### Stream failures and restarts
+
+A stream fails when a USB transfer fails for good (on a marginal link, see
+the troubleshooting section below) or when the board is unplugged. With
+`restart = true` (the default) the agent keeps running:
+
+1. The records the stream had already decoded are still published.
+2. The plugin closes the board, opens it again (by serial number, so it
+   never switches to another board), sets the pin modes again and starts a
+   new stream. This runs on a separate thread, so `get_output()` never
+   blocks the agent.
+3. The next frame with data returns `warning`, e.g. `stream restarted after:
+   bulk IN transfer failed: LIBUSB_ERROR_IO (gap 184.2 ms, ~1841 records
+   missed)`, and carries `qos.restarts` and `qos.gap_us`.
+4. If the board does not answer (unplugged, or hung until replugged), every
+   failed attempt returns `error`, which MADS reports as an agent event with
+   the reason, and the next attempt follows after 0.5, 1, 2, 4 and then
+   every 5 s. Streaming resumes as soon as the board is back.
+
+`t_us` never goes backwards across a restart. If the board kept running, it
+is still the board's own clock, and the gap shows up as a jump in `t_us`.
+If the board was reset (unplugged or power-cycled), its clock started again
+from zero: `t_us` then continues from the host's measure of the time that
+went by, and `time_ref.t_us` differs from `time_ref.device_us` from then on.
+
+With `restart = false`, or once `max_restarts` failures have been
+recovered, a failure publishes the remaining records and then returns
+`critical` with the driver's reason, e.g. `stream stopped: bulk IN transfer
+failed: LIBUSB_ERROR_IO`, and the agent stops.
 
 ### Troubleshooting: Portenta H7 and High Speed USB
 
@@ -221,6 +266,12 @@ connected and without it. The hub retransmits every packet, splitting one
 marginal link into two short ones, while the board still runs at High Speed.
 If you see these symptoms, put a USB 2.0 or USB 3 hub (external power not
 needed) between the computer and the board, and prefer a short cable.
+
+Without a hub, `restart = true` keeps the agent streaming through these
+failures, at the cost of a gap each time: 3 minutes at 10 kHz on the direct
+Mac link recovered from 11 failures, with gaps of 28–114 ms and about 0.5 %
+of the records missing overall. A board that stops answering altogether
+still needs a replug; the plugin resumes by itself once it is back.
 
 ### Tips
 

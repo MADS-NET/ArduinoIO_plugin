@@ -70,19 +70,31 @@ Source output frame: `{"digital": {"<pin>": 0|1, ...}, "analog": {"<pin>": <volt
 - INI section: `[arduinostream]` (or whatever `-n` selects).
 - Key internal pieces: `TimeUnwrapper` (turns the device's wrapping 32-bit
   `micros()` into a monotonic 64-bit timestamp, seeded from a `DeviceTime`
-  anchor taken in `set_params()` before the stream starts — `read_time()`
-  throws `DeviceBusy` once a `Stream` is running); `_staging`, a flat
-  `vector<Sample>` drained from the `Stream` queue every tick and shifted
-  left after each published chunk.
+  anchor taken before each stream starts — `read_time()` throws
+  `DeviceBusy` once a `Stream` is running); `SessionTimeline` (puts every
+  stream session on one `t_us` timeline that never goes backwards, bridging
+  a board reset with host time); `_staging` / `_staging_t`, flat buffers
+  drained from the `Stream` queue every tick, each record timestamped as it
+  is drained, and shifted left after each published chunk.
+- **Restarts** (`restart`, `max_restarts`): when the `Stream` stops,
+  `get_output()` drains what it had decoded, then `launch_restart()` runs
+  `start_session()` (close, reopen by serial, pin modes, anchor,
+  `start_stream()`) through `std::async`. While that future is valid the
+  restart thread owns `_dev` and `_stream`: the main thread must not touch
+  either, and only publishes already-staged records. `finish_restart()`
+  collects the result, schedules backoff on failure (returns `error`), and
+  counters of ended sessions are summed into `_base`.
 - **Caveat**: starting a stream marks the `Device` "busy", but that guard is
   per-process (inside this plugin's own `Device` object) — a second MADS
   agent is a separate process with its own `Device` and does not get
   `DeviceBusy` for free. In practice it either fails to open the same board
   at all (the USB interface is already claimed) or, if it does open it, its
-  `PIN_MODE`/`RESET` on the board stops this plugin's stream (the next
-  `get_output()` then returns `critical`). Do not run `arduinousb_source` /
-  `arduinousb_sink` and `arduinostream` against the same board at the same
-  time (see the comment in `director.toml`).
+  `PIN_MODE`/`RESET` on the board stops the stream on the device. The
+  driver's `Stream` does not detect that (it keeps waiting for bulk data),
+  so this plugin just stops receiving records, without a restart or an
+  error. Do not run `arduinousb_source` / `arduinousb_sink` and
+  `arduinostream` against the same board at the same time (see the comment
+  in `director.toml`).
 
 ## Output frames
 
@@ -103,9 +115,12 @@ full frame example (`t_us`, `analog`/`digital`, `qos`, `time_ref`).
   each source file, and that test must be deterministic and self-checking:
   assert on both the returned status and the payload, and exit non-zero on
   failure. `arduinostream.cpp`'s `main()` also accepts `--offline`, which
-  runs only its hardware-free `TimeUnwrapper` checks and skips anything that
-  opens a USB device — use that flag whenever a real board must not be
-  touched.
+  runs only its hardware-free `TimeUnwrapper` / `SessionTimeline` checks and
+  skips anything that opens a USB device — use that flag whenever a real
+  board must not be touched — and `--soak SECONDS`, which streams pins 15
+  and 16 at 10 kHz and checks restarts keep `t_us` increasing and
+  `qos.totals` non-decreasing (useful on a failing link, or while
+  unplugging and replugging the board).
 - An exception must never escape a plugin method: catch it, set `_error` and
   return `return_type::error` (or `critical` in `set_params()`'s effect —
   see `reference/return-types.md`).
@@ -126,6 +141,7 @@ cmake --build build -j4
 ./build/arduinousb.plugin                  # standalone test driver (opens a real board)
 ./build/arduinostream.plugin --offline     # standalone test driver, no hardware
 ./build/arduinostream.plugin               # same, plus hardware checks if a streaming board is attached
+./build/arduinostream.plugin --soak 180    # 3 min at 10 kHz, checks behaviour across stream restarts
 mads inspect_plugin build/arduinousb.plugin
 mads inspect_plugin build/arduinostream.plugin
 mads source build/arduinousb.plugin -n arduinousb_source
