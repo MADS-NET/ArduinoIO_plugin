@@ -89,10 +89,11 @@ Source output frame: `{"digital": {"<pin>": 0|1, ...}, "analog": {"<pin>": <volt
   agent is a separate process with its own `Device` and does not get
   `DeviceBusy` for free. In practice it either fails to open the same board
   at all (the USB interface is already claimed) or, if it does open it, its
-  `PIN_MODE`/`RESET` on the board stops the stream on the device. The
-  driver's `Stream` does not detect that (it keeps waiting for bulk data),
-  so this plugin just stops receiving records, without a restart or an
-  error. Do not run `arduinousb_source` / `arduinousb_sink` and
+  `PIN_MODE`/`RESET` on the board stops the stream on the device. Since
+  ArduinoDriver v0.3.1 the `Stream` worker notices (its `GET_STREAM_STATUS`
+  poll reports `running == 0`) and ends with an error, so this plugin
+  restarts the stream and the two agents keep undoing each other. Do not
+  run `arduinousb_source` / `arduinousb_sink` and
   `arduinostream` against the same board at the same time (see the comment
   in `director.toml`).
 

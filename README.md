@@ -102,9 +102,10 @@ MADS agent is a separate process with its own `Device` and does not see it.
 In practice, another agent pointed at the *same* board either fails to open
 it at all (its USB interface is already claimed by the streaming process),
 or — if it does get through — its `PIN_MODE` on a streamed pin, or a
-`RESET`, stops the stream on the board. This plugin then simply receives no
-more records: the driver does not notice that the board stopped streaming,
-so it neither restarts the stream nor reports an error. Run only one of
+`RESET`, stops the stream on the board. The driver notices within about
+half a second and ends the stream, and this plugin then restarts it like
+after any other failure (see [Stream failures and restarts](#stream-failures-and-restarts)),
+so the two agents would keep undoing each other. Run only one of
 `arduinousb_source`/`arduinousb_sink`/`arduinostream` against a given board
 at a time — see the comment next to `[arduinostream]` in `director.toml`.
 
@@ -225,7 +226,8 @@ message describing the loss attached under the `warning` key — instead of
 ### Stream failures and restarts
 
 A stream fails when a USB transfer fails for good (on a marginal link, see
-the troubleshooting section below) or when the board is unplugged. With
+the troubleshooting section below), when the board is unplugged, or when
+the board stops sampling on its own (e.g. another session's `RESET`). With
 `restart = true` (the default) the agent keeps running:
 
 1. The records the stream had already decoded are still published.
